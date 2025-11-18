@@ -174,7 +174,7 @@ class SkillDashboardHandler {
 
     static async getRecommendations(userId, learningPathId, skills) {
         const weakSkills = skills
-            .filter(s => s.score < 3.5)
+            .filter(s => s.score < 3)
             .sort((a, b) => a.score - b.score);
 
         const recommendations = [];
