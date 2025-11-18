@@ -1,0 +1,24 @@
+{
+  "name": "skill-radar-api",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "nodemon src/server.js",
+    "seed": "node src/seeders/seed.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@hapi/hapi": "^21.4.4",
+    "dotenv": "^17.2.3",
+    "joi": "^18.0.1",
+    "mongoose": "^8.19.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
