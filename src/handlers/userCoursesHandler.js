@@ -183,6 +183,7 @@ class UserCoursesHandler {
             );
 
             userCourse.status = 'completed';
+            userCourse.progress_percentage = 100;
             userCourse.course_score = courseScore;
             userCourse.tanggal_selesai = new Date();
             await userCourse.save();
@@ -212,6 +213,7 @@ class UserCoursesHandler {
         const today = new Date();
         const startOfDay = new Date(today.setHours(0, 0, 0, 0));
         const endOfDay = new Date(today.setHours(23, 59, 59, 999));
+
         const existingSnapshot = await SkillSnapshot.findOne({
             user_id: userId,
             learning_path_id: learningPathId,

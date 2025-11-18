@@ -67,7 +67,6 @@ class SkillDashboardHandler {
                         weakest: snapshot.weakest_skill,
                         average: snapshot.average_score
                     };
-
                     recommendations = await SkillDashboardHandler.getRecommendations(userId, targetLpId, skills);
                 } else {
                     skills = [];
@@ -142,30 +141,48 @@ class SkillDashboardHandler {
         const skills = await Skill.find({ learning_path_id: learningPathId })
             .sort({ display_order: 1 });
 
-        const skillScores = [];
+        const skillIds = skills.map(s => s.skill_id);
+        const courseSkills = await CourseSkill.find({ skill_id: { $in: skillIds } });
 
-        for (const skill of skills) {
-            const courseSkills = await CourseSkill.find({ skill_id: skill.skill_id });
+        const courseIds = [...new Set(courseSkills.map(cs => cs.course_id))];
+        const userCourses = await UserCourse.find({
+            user_id: userId,
+            course_id: { $in: courseIds },
+            status: 'completed'
+        });
+
+        const userCourseMap = new Map();
+        userCourses.forEach(uc => {
+            if (uc.course_score) {
+                userCourseMap.set(uc.course_id, uc.course_score);
+            }
+        });
+
+        const courseSkillsBySkill = new Map();
+        courseSkills.forEach(cs => {
+            if (!courseSkillsBySkill.has(cs.skill_id)) {
+                courseSkillsBySkill.set(cs.skill_id, []);
+            }
+            courseSkillsBySkill.get(cs.skill_id).push(cs);
+        });
+
+        const skillScores = skills.map(skill => {
+            const relatedCourseSkills = courseSkillsBySkill.get(skill.skill_id) || [];
             const courseScores = [];
 
-            for (const cs of courseSkills) {
-                const userCourse = await UserCourse.findOne({
-                    user_id: userId,
-                    course_id: cs.course_id,
-                    status: 'completed'
-                });
-
-                if (userCourse && userCourse.course_score) {
+            relatedCourseSkills.forEach(cs => {
+                const score = userCourseMap.get(cs.course_id);
+                if (score) {
                     courseScores.push({
-                        score: userCourse.course_score,
+                        score: score,
                         bobot: cs.bobot
                     });
                 }
-            }
+            });
 
             const skillScore = CalculationUtils.calculateSkillScore(courseScores);
-            skillScores.push({ name: skill.skill_name, score: skillScore });
-        }
+            return { name: skill.skill_name, score: skillScore };
+        });
 
         const summary = CalculationUtils.calculateSummary(skillScores);
 
@@ -174,44 +191,67 @@ class SkillDashboardHandler {
 
     static async getRecommendations(userId, learningPathId, skills) {
         const weakSkills = skills
-            .filter(s => s.score < 2.5)
+            .filter(s => s.score < 3)
             .sort((a, b) => a.score - b.score);
+
+        if (weakSkills.length === 0) {
+            return [];
+        }
+
+        const skillNames = weakSkills.map(s => s.name);
+        const skillDocs = await Skill.find({
+            skill_name: { $in: skillNames },
+            learning_path_id: learningPathId
+        });
+
+        const skillMap = new Map();
+        skillDocs.forEach(s => skillMap.set(s.skill_name, s));
+
+        const skillIds = skillDocs.map(s => s.skill_id);
+        const courseSkills = await CourseSkill.find({
+            skill_id: { $in: skillIds }
+        }).sort({ bobot: -1 });
+
+        const courseSkillsBySkillId = new Map();
+        courseSkills.forEach(cs => {
+            if (!courseSkillsBySkillId.has(cs.skill_id)) {
+                courseSkillsBySkillId.set(cs.skill_id, []);
+            }
+            courseSkillsBySkillId.get(cs.skill_id).push(cs);
+        });
+
+        const allCourseIds = courseSkills.map(cs => cs.course_id);
+        const courses = await Course.find({ course_id: { $in: allCourseIds } });
+        const courseMap = new Map();
+        courses.forEach(c => courseMap.set(c.course_id, c));
+
+        const userCourses = await UserCourse.find({
+            user_id: userId,
+            course_id: { $in: allCourseIds }
+        });
+        const userCourseMap = new Map();
+        userCourses.forEach(uc => userCourseMap.set(uc.course_id, uc));
 
         const recommendations = [];
 
         for (const weakSkill of weakSkills) {
-            const skill = await Skill.findOne({
-                skill_name: weakSkill.name,
-                learning_path_id: learningPathId
-            });
+            const skill = skillMap.get(weakSkill.name);
 
             if (!skill) {
                 console.warn(`Skill "${weakSkill.name}" not found in learning path ${learningPathId}`);
                 continue;
             }
 
-            const courseSkills = await CourseSkill.find({ skill_id: skill.skill_id })
-                .sort({ bobot: -1 });
+            const relatedCourseSkills = courseSkillsBySkillId.get(skill.skill_id) || [];
 
-            if (courseSkills.length === 0) {
+            if (relatedCourseSkills.length === 0) {
                 console.warn(`No courses found for skill "${weakSkill.name}"`);
                 continue;
             }
 
-            const courseIds = courseSkills.map(cs => cs.course_id);
-
-            const allCourses = await Course.find({
-                course_id: { $in: courseIds }
-            });
-
-            const userCourses = await UserCourse.find({
-                user_id: userId,
-                course_id: { $in: courseIds }
-            });
-
-            const recommendedCourses = allCourses.map(course => {
-                const userCourse = userCourses.find(uc => uc.course_id === course.course_id);
-                const courseSkill = courseSkills.find(cs => cs.course_id === course.course_id);
+            const recommendedCourses = relatedCourseSkills.map(cs => {
+                const course = courseMap.get(cs.course_id);
+                const userCourse = userCourseMap.get(cs.course_id);
 
                 let status = 'not_started';
                 let courseScore = null;
@@ -223,16 +263,14 @@ class SkillDashboardHandler {
                     courseScore = userCourse.course_score;
                 }
 
-                const bobot = courseSkill.bobot / 100;
+                const bobot = cs.bobot / 100;
 
                 if (status === 'not_started') {
                     impactScore = bobot * 5;
                     shouldPrioritize = bobot >= 0.4;
-
                 } else if (status === 'in_progress') {
                     impactScore = bobot * 5;
                     shouldPrioritize = bobot >= 0.3;
-
                 } else if (status === 'completed' && courseScore !== null) {
                     const gap = 5 - courseScore;
                     impactScore = bobot * gap;
@@ -243,7 +281,7 @@ class SkillDashboardHandler {
                     id: course.course_id,
                     name: course.course_name,
                     status: status,
-                    bobot: courseSkill.bobot,
+                    bobot: cs.bobot,
                     current_score: courseScore,
                     impact_score: parseFloat(impactScore.toFixed(2)),
                     should_prioritize: shouldPrioritize
