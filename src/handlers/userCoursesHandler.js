@@ -214,32 +214,54 @@ class UserCoursesHandler {
         const startOfDay = new Date(today.setHours(0, 0, 0, 0));
         const endOfDay = new Date(today.setHours(23, 59, 59, 999));
 
-        const existingSnapshot = await SkillSnapshot.findOne({
-            user_id: userId,
-            learning_path_id: learningPathId,
-            snapshot_date: {
-                $gte: startOfDay,
-                $lt: endOfDay
+        const [existingSnapshot, skills] = await Promise.all([
+            SkillSnapshot.findOne({
+                user_id: userId,
+                learning_path_id: learningPathId,
+                snapshot_date: {
+                    $gte: startOfDay,
+                    $lt: endOfDay
+                }
+            }),
+            Skill.find({ learning_path_id: learningPathId })
+        ]);
+
+        const skillIds = skills.map(s => s.skill_id);
+
+        const [courseSkills, completedUserCourses] = await Promise.all([
+            CourseSkill.find({ skill_id: { $in: skillIds } }),
+            UserCourse.find({
+                user_id: userId,
+                status: 'completed'
+            })
+        ]);
+
+        const userCourseMap = new Map();
+        completedUserCourses.forEach(uc => {
+            if (uc.course_score) {
+                userCourseMap.set(uc.course_id, uc.course_score);
             }
         });
 
-        const skills = await Skill.find({ learning_path_id: learningPathId });
+        const courseSkillsBySkillId = new Map();
+        courseSkills.forEach(cs => {
+            if (!courseSkillsBySkillId.has(cs.skill_id)) {
+                courseSkillsBySkillId.set(cs.skill_id, []);
+            }
+            courseSkillsBySkillId.get(cs.skill_id).push(cs);
+        });
+
         const skillData = new Map();
 
         for (const skill of skills) {
-            const courseSkills = await CourseSkill.find({ skill_id: skill.skill_id });
+            const relatedCourseSkills = courseSkillsBySkillId.get(skill.skill_id) || [];
             const courseScores = [];
 
-            for (const cs of courseSkills) {
-                const userCourse = await UserCourse.findOne({
-                    user_id: userId,
-                    course_id: cs.course_id,
-                    status: 'completed'
-                });
-
-                if (userCourse && userCourse.course_score) {
+            for (const cs of relatedCourseSkills) {
+                const score = userCourseMap.get(cs.course_id);
+                if (score) {
                     courseScores.push({
-                        score: userCourse.course_score,
+                        score: score,
                         bobot: cs.bobot
                     });
                 }
