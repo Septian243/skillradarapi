@@ -4,3 +4,6 @@
 node_modules
 dist
 src/seeders/
+
+# Environment variables
+.env
