@@ -26,7 +26,7 @@ const init = async () => {
         handler: (request, h) => {
             return {
                 status: 'ok',
-                message: 'Learning Path API is running',
+                message: 'Skill Radar API is Running',
                 timestamp: new Date().toISOString()
             };
         }

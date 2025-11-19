@@ -42,12 +42,22 @@ class SkillDashboardHandler {
             let skills, summary, recommendations;
 
             const isToday = targetDate.toDateString() === new Date().toDateString();
+
             if (isToday && isActiveLp) {
                 const skillData = await SkillDashboardHandler.calculateRealTimeSkills(userId, targetLpId);
                 skills = skillData.skills;
                 summary = skillData.summary;
                 recommendations = await SkillDashboardHandler.getRecommendations(userId, targetLpId, skills);
             } else {
+                const latestSnapshot = await SkillSnapshot.findOne({
+                    user_id: userId,
+                    learning_path_id: targetLpId
+                }).sort({ snapshot_date: -1 });
+
+                const isLatestSnapshotDate = latestSnapshot &&
+                    latestSnapshot.snapshot_date.toISOString().split('T')[0] ===
+                    targetDate.toISOString().split('T')[0];
+
                 const snapshot = await SkillSnapshot.findOne({
                     user_id: userId,
                     learning_path_id: targetLpId,
@@ -67,11 +77,26 @@ class SkillDashboardHandler {
                         weakest: snapshot.weakest_skill,
                         average: snapshot.average_score
                     };
-                    recommendations = await SkillDashboardHandler.getRecommendations(userId, targetLpId, skills);
+
+                    if (isActiveLp) {
+                        recommendations = [];
+                    } else {
+                        if (isLatestSnapshotDate) {
+                            recommendations = await SkillDashboardHandler.getRecommendations(userId, targetLpId, skills);
+                        } else {
+                            recommendations = [];
+                        }
+                    }
                 } else {
-                    skills = [];
-                    summary = { strongest: null, weakest: null, average: 0 };
-                    recommendations = [];
+                    const skillData = await SkillDashboardHandler.calculateRealTimeSkills(userId, targetLpId);
+                    skills = skillData.skills;
+                    summary = skillData.summary;
+
+                    if (isActiveLp || !latestSnapshot) {
+                        recommendations = await SkillDashboardHandler.getRecommendations(userId, targetLpId, skills);
+                    } else {
+                        recommendations = [];
+                    }
                 }
             }
 
@@ -96,6 +121,7 @@ class SkillDashboardHandler {
     }
 
     static async getDropdowns(userId, currentLpId, isActiveLp) {
+        const user = await User.findOne({ user_id: userId });
         const userCourses = await UserCourse.find({ user_id: userId });
         const courseIds = userCourses.map(uc => uc.course_id);
         const courses = await Course.find({ course_id: { $in: courseIds } });
@@ -106,7 +132,7 @@ class SkillDashboardHandler {
         const lpDropdown = learningPaths.map(lp => ({
             id: lp.learning_path_id,
             name: lp.learning_path_name,
-            is_active: lp.learning_path_id === currentLpId
+            is_active: lp.learning_path_id === user.active_learning_path_id
         }));
 
         const snapshots = await SkillSnapshot.find({
@@ -249,50 +275,97 @@ class SkillDashboardHandler {
                 continue;
             }
 
+            let inProgressCount = 0;
+            let notStartedCount = 0;
+            let completedLowScoreCount = 0;
+            let highestBobot = 0;
+
             const recommendedCourses = relatedCourseSkills.map(cs => {
                 const course = courseMap.get(cs.course_id);
                 const userCourse = userCourseMap.get(cs.course_id);
 
                 let status = 'not_started';
                 let courseScore = null;
-                let impactScore = 0;
-                let shouldPrioritize = false;
+                let priority = 'low';
+                let action = '';
 
                 if (userCourse) {
                     status = userCourse.status;
                     courseScore = userCourse.course_score;
                 }
 
-                const bobot = cs.bobot / 100;
+                const bobot = cs.bobot;
+                if (bobot > highestBobot) highestBobot = bobot;
 
                 if (status === 'not_started') {
-                    impactScore = bobot * 5;
-                    shouldPrioritize = bobot >= 0.4;
+                    notStartedCount++;
+                    if (bobot >= 50) {
+                        priority = 'high';
+                        action = 'Prioritas tinggi - Segera kerjakan kelas ini';
+                    } else if (bobot >= 30) {
+                        priority = 'medium';
+                        action = 'Kerjakan setelah kelas prioritas tinggi selesai';
+                    } else {
+                        priority = 'low';
+                        action = 'Kerjakan jika ada waktu';
+                    }
                 } else if (status === 'in_progress') {
-                    impactScore = bobot * 5;
-                    shouldPrioritize = bobot >= 0.3;
-                } else if (status === 'completed' && courseScore !== null) {
-                    const gap = 5 - courseScore;
-                    impactScore = bobot * gap;
-                    shouldPrioritize = impactScore >= 1.0;
+                    inProgressCount++;
+                    if (bobot >= 40) {
+                        priority = 'high';
+                        action = 'Prioritas tinggi - Selesaikan kelas ini segera';
+                    } else {
+                        priority = 'medium';
+                        action = 'Lanjutkan dan selesaikan kelas ini';
+                    }
+                } else if (status === 'completed') {
+                    const gap = 5 - (courseScore || 0);
+                    const impactScore = (bobot / 100) * gap;
+
+                    if (impactScore >= 1.0) {
+                        completedLowScoreCount++;
+                        priority = 'medium';
+                        action = `Ulangi untuk meningkatkan nilai dari ${courseScore?.toFixed(2) || 0}`;
+                    } else {
+                        priority = 'low';
+                        action = 'Nilai sudah baik, fokus ke kelas lain';
+                    }
                 }
 
                 return {
                     id: course.course_id,
                     name: course.course_name,
                     status: status,
-                    bobot: cs.bobot,
-                    current_score: courseScore,
-                    impact_score: parseFloat(impactScore.toFixed(2)),
-                    should_prioritize: shouldPrioritize
+                    course_score: courseScore,
+                    bobot_kontribusi: bobot,
+                    priority: priority,
+                    action: action
                 };
             });
 
-            recommendedCourses.sort((a, b) => b.impact_score - a.impact_score);
+            const priorityOrder = { 'high': 1, 'medium': 2, 'low': 3 };
+            recommendedCourses.sort((a, b) => {
+                const priorityDiff = priorityOrder[a.priority] - priorityOrder[b.priority];
+                if (priorityDiff !== 0) return priorityDiff;
+                return b.bobot_kontribusi - a.bobot_kontribusi;
+            });
+
+            let recommendationSummary = '';
+            if (inProgressCount > 0) {
+                recommendationSummary = `Selesaikan ${inProgressCount} kelas yang sedang berjalan terlebih dahulu.`;
+            } else if (notStartedCount > 0) {
+                recommendationSummary = `Mulai dengan kelas yang memiliki bobot kontribusi tertinggi.`;
+            } else if (completedLowScoreCount > 0) {
+                recommendationSummary = `Ulangi ${completedLowScoreCount} kelas dengan nilai rendah untuk meningkatkan skor skill.`;
+            } else {
+                recommendationSummary = `Semua kelas sudah diselesaikan dengan baik. Pertimbangkan kelas lanjutan.`;
+            }
 
             recommendations.push({
                 skill: weakSkill.name,
-                current_score: weakSkill.score,
+                current_score: parseFloat(weakSkill.score.toFixed(2)),
+                target_score: 3.0,
+                recommendation_summary: recommendationSummary,
                 courses: recommendedCourses
             });
         }

@@ -1,7 +1,15 @@
 class CalculationUtils {
     static calculateCourseScore(nilaiUjian, nilaiSubmission) {
-        const ujianScore = nilaiUjian ? (nilaiUjian / 100) * 5 * 0.3 : 0;
-        const submissionScore = nilaiSubmission ? nilaiSubmission * 0.7 : 0;
+        if (!nilaiUjian) return 0;
+
+        const ujianScaled = (nilaiUjian / 100) * 5;
+
+        if (!nilaiSubmission) {
+            return parseFloat(ujianScaled.toFixed(2));
+        }
+
+        const ujianScore = ujianScaled * 0.3;
+        const submissionScore = nilaiSubmission * 0.7;
         return parseFloat((ujianScore + submissionScore).toFixed(2));
     }
 
