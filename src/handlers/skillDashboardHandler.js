@@ -13,9 +13,17 @@ class SkillDashboardHandler {
     static async getSkillDashboard(request, h) {
         try {
             const { userId } = request.params;
-            const { learning_path_id, date } = request.query;
+            let { learning_path_id, date } = request.query;
 
-            const user = await User.findOne({ user_id: userId });
+            if (learning_path_id) {
+                learning_path_id = parseInt(learning_path_id, 10);
+            }
+
+            if (date === 'undefined' || date === '' || date === null) {
+                date = undefined;
+            }
+
+            const user = await User.findOne({ user_id: userId }).lean();
             if (!user) {
                 throw Boom.notFound('User tidak ditemukan');
             }
@@ -32,18 +40,20 @@ class SkillDashboardHandler {
                 const lastSnapshot = await SkillSnapshot.findOne({
                     user_id: userId,
                     learning_path_id: targetLpId
-                }).sort({ snapshot_date: -1 });
+                }).sort({ snapshot_date: -1 }).lean();
                 targetDate = lastSnapshot ? lastSnapshot.snapshot_date : new Date();
             }
 
-            const learningPath = await LearningPath.findOne({ learning_path_id: targetLpId });
-            const dropdowns = await SkillDashboardHandler.getDropdowns(userId, targetLpId, isActiveLp);
+            const [learningPath, dropdowns] = await Promise.all([
+                LearningPath.findOne({ learning_path_id: targetLpId }).lean(),
+                SkillDashboardHandler.getDropdowns(userId, targetLpId, isActiveLp)
+            ]);
 
             let skills, summary, recommendations;
 
             const isToday = targetDate.toDateString() === new Date().toDateString();
 
-            if (isToday && isActiveLp) {
+            if ((isToday && isActiveLp) || (!date && isActiveLp)) {
                 const skillData = await SkillDashboardHandler.calculateRealTimeSkills(userId, targetLpId);
                 skills = skillData.skills;
                 summary = skillData.summary;
@@ -52,26 +62,40 @@ class SkillDashboardHandler {
                 const latestSnapshot = await SkillSnapshot.findOne({
                     user_id: userId,
                     learning_path_id: targetLpId
-                }).sort({ snapshot_date: -1 });
+                }).sort({ snapshot_date: -1 }).lean();
 
                 const isLatestSnapshotDate = latestSnapshot &&
                     latestSnapshot.snapshot_date.toISOString().split('T')[0] ===
                     targetDate.toISOString().split('T')[0];
 
+                const startOfDay = new Date(targetDate);
+                startOfDay.setHours(0, 0, 0, 0);
+
+                const endOfDay = new Date(targetDate);
+                endOfDay.setHours(23, 59, 59, 999);
+
                 const snapshot = await SkillSnapshot.findOne({
                     user_id: userId,
                     learning_path_id: targetLpId,
                     snapshot_date: {
-                        $gte: new Date(targetDate.setHours(0, 0, 0, 0)),
-                        $lt: new Date(targetDate.setHours(23, 59, 59, 999))
+                        $gte: startOfDay,
+                        $lt: endOfDay
                     }
-                });
+                }).lean();
 
                 if (snapshot) {
-                    skills = Array.from(snapshot.skill_data.entries()).map(([name, score]) => ({
-                        name,
-                        score
-                    }));
+                    if (snapshot.skill_data instanceof Map) {
+                        skills = Array.from(snapshot.skill_data.entries()).map(([name, score]) => ({
+                            name,
+                            score
+                        }));
+                    } else {
+                        skills = Object.entries(snapshot.skill_data).map(([name, score]) => ({
+                            name,
+                            score
+                        }));
+                    }
+
                     summary = {
                         strongest: snapshot.strongest_skill,
                         weakest: snapshot.weakest_skill,
@@ -121,13 +145,20 @@ class SkillDashboardHandler {
     }
 
     static async getDropdowns(userId, currentLpId, isActiveLp) {
-        const user = await User.findOne({ user_id: userId });
-        const userCourses = await UserCourse.find({ user_id: userId });
+        const [user, userCourses, snapshots] = await Promise.all([
+            User.findOne({ user_id: userId }).lean(),
+            UserCourse.find({ user_id: userId }).lean(),
+            SkillSnapshot.find({
+                user_id: userId,
+                learning_path_id: currentLpId
+            }).sort({ snapshot_date: -1 }).limit(10).lean()
+        ]);
+
         const courseIds = userCourses.map(uc => uc.course_id);
-        const courses = await Course.find({ course_id: { $in: courseIds } });
+        const courses = await Course.find({ course_id: { $in: courseIds } }).lean();
 
         const lpIds = [...new Set(courses.map(c => c.learning_path_id))];
-        const learningPaths = await LearningPath.find({ learning_path_id: { $in: lpIds } });
+        const learningPaths = await LearningPath.find({ learning_path_id: { $in: lpIds } }).lean();
 
         const lpDropdown = learningPaths.map(lp => ({
             id: lp.learning_path_id,
@@ -135,26 +166,34 @@ class SkillDashboardHandler {
             is_active: lp.learning_path_id === user.active_learning_path_id
         }));
 
-        const snapshots = await SkillSnapshot.find({
-            user_id: userId,
-            learning_path_id: currentLpId
-        }).sort({ snapshot_date: -1 }).limit(10);
+        const today = new Date();
+        const todayStr = today.toISOString().split('T')[0];
+        const dateDropdown = [];
 
-        const today = new Date().toISOString().split('T')[0];
-        const dateDropdown = snapshots.map(s => {
-            const dateStr = s.snapshot_date.toISOString().split('T')[0];
-            return {
-                date: dateStr,
-                label: dateStr === today ? 'Hari Ini' : new Date(dateStr).toLocaleDateString('id-ID', {
+        const isCurrentLpActive = currentLpId === user.active_learning_path_id;
+
+        if (isCurrentLpActive) {
+            dateDropdown.push({
+                date: todayStr,
+                label: 'Hari Ini'
+            });
+        }
+
+        for (const snapshot of snapshots) {
+            const snapshotDateStr = snapshot.snapshot_date.toISOString().split('T')[0];
+
+            if (snapshotDateStr === todayStr) {
+                continue;
+            }
+
+            dateDropdown.push({
+                date: snapshotDateStr,
+                label: new Date(snapshotDateStr).toLocaleDateString('id-ID', {
                     day: 'numeric',
                     month: 'short',
                     year: 'numeric'
                 })
-            };
-        });
-
-        if (isActiveLp && !dateDropdown.some(d => d.date === today)) {
-            dateDropdown.unshift({ date: today, label: 'Hari Ini' });
+            });
         }
 
         return {
@@ -164,18 +203,18 @@ class SkillDashboardHandler {
     }
 
     static async calculateRealTimeSkills(userId, learningPathId) {
-        const skills = await Skill.find({ learning_path_id: learningPathId })
-            .sort({ display_order: 1 });
+        const [skills, courseSkills, userCourses] = await Promise.all([
+            Skill.find({ learning_path_id: learningPathId }).sort({ display_order: 1 }).lean(),
+            CourseSkill.find({}).lean(),
+            UserCourse.find({
+                user_id: userId,
+                status: 'completed'
+            }).lean()
+        ]);
 
         const skillIds = skills.map(s => s.skill_id);
-        const courseSkills = await CourseSkill.find({ skill_id: { $in: skillIds } });
 
-        const courseIds = [...new Set(courseSkills.map(cs => cs.course_id))];
-        const userCourses = await UserCourse.find({
-            user_id: userId,
-            course_id: { $in: courseIds },
-            status: 'completed'
-        });
+        const relevantCourseSkills = courseSkills.filter(cs => skillIds.includes(cs.skill_id));
 
         const userCourseMap = new Map();
         userCourses.forEach(uc => {
@@ -185,7 +224,7 @@ class SkillDashboardHandler {
         });
 
         const courseSkillsBySkill = new Map();
-        courseSkills.forEach(cs => {
+        relevantCourseSkills.forEach(cs => {
             if (!courseSkillsBySkill.has(cs.skill_id)) {
                 courseSkillsBySkill.set(cs.skill_id, []);
             }
@@ -225,38 +264,36 @@ class SkillDashboardHandler {
         }
 
         const skillNames = weakSkills.map(s => s.name);
-        const skillDocs = await Skill.find({
-            skill_name: { $in: skillNames },
-            learning_path_id: learningPathId
-        });
+
+        const [skillDocs, courseSkills, courses, userCourses] = await Promise.all([
+            Skill.find({
+                skill_name: { $in: skillNames },
+                learning_path_id: learningPathId
+            }).lean(),
+            CourseSkill.find({}).sort({ bobot: -1 }).lean(),
+            Course.find({}).lean(),
+            UserCourse.find({ user_id: userId }).lean()
+        ]);
 
         const skillMap = new Map();
         skillDocs.forEach(s => skillMap.set(s.skill_name, s));
 
+        const courseMap = new Map();
+        courses.forEach(c => courseMap.set(c.course_id, c));
+
+        const userCourseMap = new Map();
+        userCourses.forEach(uc => userCourseMap.set(uc.course_id, uc));
+
         const skillIds = skillDocs.map(s => s.skill_id);
-        const courseSkills = await CourseSkill.find({
-            skill_id: { $in: skillIds }
-        }).sort({ bobot: -1 });
+        const relevantCourseSkills = courseSkills.filter(cs => skillIds.includes(cs.skill_id));
 
         const courseSkillsBySkillId = new Map();
-        courseSkills.forEach(cs => {
+        relevantCourseSkills.forEach(cs => {
             if (!courseSkillsBySkillId.has(cs.skill_id)) {
                 courseSkillsBySkillId.set(cs.skill_id, []);
             }
             courseSkillsBySkillId.get(cs.skill_id).push(cs);
         });
-
-        const allCourseIds = courseSkills.map(cs => cs.course_id);
-        const courses = await Course.find({ course_id: { $in: allCourseIds } });
-        const courseMap = new Map();
-        courses.forEach(c => courseMap.set(c.course_id, c));
-
-        const userCourses = await UserCourse.find({
-            user_id: userId,
-            course_id: { $in: allCourseIds }
-        });
-        const userCourseMap = new Map();
-        userCourses.forEach(uc => userCourseMap.set(uc.course_id, uc));
 
         const recommendations = [];
 

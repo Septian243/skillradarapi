@@ -15,7 +15,7 @@ class UserCoursesHandler {
             const { userId } = request.params;
             const { tab } = request.query;
 
-            const user = await User.findOne({ user_id: userId });
+            const user = await User.findOne({ user_id: userId }).lean();
             if (!user) {
                 throw Boom.notFound('User tidak ditemukan');
             }
@@ -33,21 +33,32 @@ class UserCoursesHandler {
 
     // GET courses dari active learning path
     static async getActiveCourses(user) {
-        const learningPath = await LearningPath.findOne({
-            learning_path_id: user.active_learning_path_id
-        });
+        const [learningPath, courses, userCourses] = await Promise.all([
+            LearningPath.findOne({
+                learning_path_id: user.active_learning_path_id
+            }).lean(),
+            Course.find({
+                learning_path_id: user.active_learning_path_id
+            }).sort({ course_id: 1 }).lean(),
+            UserCourse.find({
+                user_id: user.user_id,
+                course_id: { $in: [] }
+            }).lean()
+        ]);
 
-        const courses = await Course.find({
-            learning_path_id: user.active_learning_path_id
-        }).sort({ course_id: 1 });
-
-        const userCourses = await UserCourse.find({
+        const courseIds = courses.map(c => c.course_id);
+        const allUserCourses = await UserCourse.find({
             user_id: user.user_id,
-            course_id: { $in: courses.map(c => c.course_id) }
+            course_id: { $in: courseIds }
+        }).lean();
+
+        const userCourseMap = new Map();
+        allUserCourses.forEach(uc => {
+            userCourseMap.set(uc.course_id, uc);
         });
 
         const coursesData = courses.map(course => {
-            const userCourse = userCourses.find(uc => uc.course_id === course.course_id);
+            const userCourse = userCourseMap.get(course.course_id);
             return {
                 id: course.course_id,
                 name: course.course_name,
@@ -71,23 +82,31 @@ class UserCoursesHandler {
         const completedUserCourses = await UserCourse.find({
             user_id: userId,
             status: 'completed'
-        }).sort({ tanggal_selesai: -1 });
+        }).sort({ tanggal_selesai: -1 }).lean();
 
         const courseIds = completedUserCourses.map(uc => uc.course_id);
-        const courses = await Course.find({ course_id: { $in: courseIds } });
 
-        const learningPathIds = [...new Set(courses.map(c => c.learning_path_id))];
-        const learningPaths = await LearningPath.find({
-            learning_path_id: { $in: learningPathIds }
+        const [courses, learningPaths] = await Promise.all([
+            Course.find({ course_id: { $in: courseIds } }).lean(),
+            (async () => {
+                const tempCourses = await Course.find({ course_id: { $in: courseIds } }).lean();
+                const learningPathIds = [...new Set(tempCourses.map(c => c.learning_path_id))];
+                return LearningPath.find({
+                    learning_path_id: { $in: learningPathIds }
+                }).lean();
+            })()
+        ]);
+
+        const completedCoursesMap = new Map();
+        completedUserCourses.forEach(uc => {
+            completedCoursesMap.set(uc.course_id, uc);
         });
 
         const groupedData = learningPaths.map(lp => {
             const lpCourses = courses
                 .filter(c => c.learning_path_id === lp.learning_path_id)
                 .map(course => {
-                    const userCourse = completedUserCourses.find(
-                        uc => uc.course_id === course.course_id
-                    );
+                    const userCourse = completedCoursesMap.get(course.course_id);
                     return {
                         id: course.course_id,
                         name: course.course_name,
@@ -114,23 +133,25 @@ class UserCoursesHandler {
         try {
             const { userId, courseId } = request.params;
 
-            const course = await Course.findOne({ course_id: courseId });
+            const [course, userCourse] = await Promise.all([
+                Course.findOne({ course_id: courseId }).lean(),
+                UserCourse.findOne({
+                    user_id: userId,
+                    course_id: courseId
+                }).lean()
+            ]);
+
             if (!course) {
                 throw Boom.notFound('Course tidak ditemukan');
             }
 
-            const learningPath = await LearningPath.findOne({
-                learning_path_id: course.learning_path_id
-            });
-
-            const userCourse = await UserCourse.findOne({
-                user_id: userId,
-                course_id: courseId
-            });
-
             if (!userCourse) {
                 throw Boom.notFound('User belum terdaftar di course ini');
             }
+
+            const learningPath = await LearningPath.findOne({
+                learning_path_id: course.learning_path_id
+            }).lean();
 
             const data = {
                 id: course.course_id,
@@ -186,10 +207,13 @@ class UserCoursesHandler {
             userCourse.progress_percentage = 100;
             userCourse.course_score = courseScore;
             userCourse.tanggal_selesai = new Date();
-            await userCourse.save();
 
-            const course = await Course.findOne({ course_id: courseId });
-            await UserCoursesHandler.saveSkillSnapshot(userId, course.learning_path_id);
+            const course = await Course.findOne({ course_id: courseId }).lean();
+
+            await Promise.all([
+                userCourse.save(),
+                UserCoursesHandler.saveSkillSnapshot(userId, course.learning_path_id)
+            ]);
 
             return {
                 error: false,
@@ -214,7 +238,7 @@ class UserCoursesHandler {
         const startOfDay = new Date(today.setHours(0, 0, 0, 0));
         const endOfDay = new Date(today.setHours(23, 59, 59, 999));
 
-        const [existingSnapshot, skills] = await Promise.all([
+        const [existingSnapshot, skills, completedUserCourses] = await Promise.all([
             SkillSnapshot.findOne({
                 user_id: userId,
                 learning_path_id: learningPathId,
@@ -223,18 +247,15 @@ class UserCoursesHandler {
                     $lt: endOfDay
                 }
             }),
-            Skill.find({ learning_path_id: learningPathId })
-        ]);
-
-        const skillIds = skills.map(s => s.skill_id);
-
-        const [courseSkills, completedUserCourses] = await Promise.all([
-            CourseSkill.find({ skill_id: { $in: skillIds } }),
+            Skill.find({ learning_path_id: learningPathId }).lean(),
             UserCourse.find({
                 user_id: userId,
                 status: 'completed'
-            })
+            }).lean()
         ]);
+
+        const skillIds = skills.map(s => s.skill_id);
+        const courseSkills = await CourseSkill.find({ skill_id: { $in: skillIds } }).lean();
 
         const userCourseMap = new Map();
         completedUserCourses.forEach(uc => {
@@ -282,7 +303,7 @@ class UserCoursesHandler {
             existingSnapshot.snapshot_date = new Date();
             await existingSnapshot.save();
         } else {
-            const lastSnapshot = await SkillSnapshot.findOne().sort({ snapshot_id: -1 });
+            const lastSnapshot = await SkillSnapshot.findOne().sort({ snapshot_id: -1 }).lean();
             const newSnapshotId = lastSnapshot ? lastSnapshot.snapshot_id + 1 : 1;
 
             const snapshot = new SkillSnapshot({
